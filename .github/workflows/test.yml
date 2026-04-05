@@ -21,17 +21,20 @@ jobs:
         run: go test -v -count=1 ./...
 
   # ─── E2E Tests ─────────────────────────────────────────────────────────────
+  #
+  # Uses `spire-server jwt mint` to call the CredentialComposer plugin directly
+  # from the server side — no agent or workload registration needed.
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
     env:
-      SPIRE_VERSION:   "1.14.4"
-      TRUST_DOMAIN:    "example.org"
-      CLAIM_NAME:      "uid"
-      DOMAIN_CHARS:    "16"
-      PATH_CHARS:      "16"
-      SERVER_SOCKET:   "/tmp/spire-server/private/api.sock"
-      AGENT_SOCKET:    "/tmp/spire-agent/public/api.sock"
+      SPIRE_VERSION:  "1.14.4"
+      TRUST_DOMAIN:   "example.org"
+      WORKLOAD_ID:    "spiffe://example.org/workload/ci"
+      CLAIM_NAME:     "uid"
+      DOMAIN_CHARS:   "16"
+      PATH_CHARS:     "16"
+      SERVER_SOCKET:  "/tmp/spire-server/private/api.sock"
 
     steps:
       - uses: actions/checkout@v4
@@ -44,16 +47,14 @@ jobs:
       - name: Build plugin
         run: go build -o spire-plugin-alnumid-credential-composer .
 
-      # Download SPIRE server and agent binaries
-      - name: Download SPIRE binaries
+      # Download SPIRE server binary only
+      - name: Download SPIRE server binary
         run: |
           curl -sSfL \
             "https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz" \
             | sudo tar -xz --strip-components=2 -C /usr/local/bin \
-                "spire-${SPIRE_VERSION}/bin/spire-server" \
-                "spire-${SPIRE_VERSION}/bin/spire-agent"
+                "spire-${SPIRE_VERSION}/bin/spire-server"
           spire-server --version
-          spire-agent  --version
 
       # Configure and start SPIRE server with the plugin
       - name: Start SPIRE server
@@ -75,8 +76,7 @@ jobs:
                 connection_string = "/tmp/spire-server/datastore.sqlite3"
               }
             }
-            KeyManager "memory"       { plugin_data {} }
-            NodeAttestor "join_token" { plugin_data {} }
+            KeyManager "memory" { plugin_data {} }
             CredentialComposer "alnumid" {
               plugin_cmd = "$(pwd)/spire-plugin-alnumid-credential-composer"
               plugin_data {
@@ -88,7 +88,7 @@ jobs:
           }
           EOF
 
-          spire-server run -config /tmp/server.conf &
+          spire-server run -config /tmp/server.conf > /tmp/spire-server.log 2>&1 &
 
           echo "Waiting for SPIRE server..."
           for i in $(seq 1 30); do
@@ -96,64 +96,23 @@ jobs:
               2>/dev/null && echo "Server ready." && break || sleep 1
           done
 
-      # Issue a join token and register a workload entry
-      - name: Register workload entry
-        run: |
-          JOIN_TOKEN=$(spire-server token generate \
-            -socketPath "${SERVER_SOCKET}" \
-            -spiffeID  "spiffe://${TRUST_DOMAIN}/agent/ci" \
-            | awk '{print $2}')
-          echo "JOIN_TOKEN=${JOIN_TOKEN}" >> "$GITHUB_ENV"
-
-          WORKLOAD_SPIFFE_ID="spiffe://${TRUST_DOMAIN}/workload/ci"
-          echo "WORKLOAD_SPIFFE_ID=${WORKLOAD_SPIFFE_ID}" >> "$GITHUB_ENV"
-
-          spire-server entry create \
-            -socketPath "${SERVER_SOCKET}" \
-            -spiffeID   "${WORKLOAD_SPIFFE_ID}" \
-            -parentID   "spiffe://${TRUST_DOMAIN}/agent/ci" \
-            -selector   "unix:uid:$(id -u)"
-
-      # Start SPIRE agent using the join token
-      - name: Start SPIRE agent
-        run: |
-          mkdir -p /tmp/spire-agent
-
-          cat > /tmp/agent.conf << EOF
-          agent {
-            data_dir       = "/tmp/spire-agent"
-            log_level      = "DEBUG"
-            trust_domain   = "${TRUST_DOMAIN}"
-            server_address = "127.0.0.1"
-            server_port    = "8081"
-            socket_path    = "${AGENT_SOCKET}"
-          }
-          plugins {
-            NodeAttestor "join_token" {
-              plugin_data { join_token = "${JOIN_TOKEN}" }
-            }
-            KeyManager "memory"     { plugin_data {} }
-            WorkloadAttestor "unix" { plugin_data {} }
-          }
-          EOF
-
-          spire-agent run -config /tmp/agent.conf &
-
-          echo "Waiting for SPIRE agent socket..."
-          for i in $(seq 1 30); do
-            [ -S "${AGENT_SOCKET}" ] && echo "Agent ready." && break || sleep 1
-          done
-
-      # Fetch a JWT-SVID and verify the custom uid claim
+      # Mint a JWT-SVID directly via the server admin API and verify the custom claim
       - name: Verify uid claim in JWT-SVID
         run: |
-          JWT=$(spire-agent api fetch jwt \
-            -audience   "spiffe://${TRUST_DOMAIN}" \
-            -socketPath "${AGENT_SOCKET}" \
-            | awk '/JWT Token/{print $NF}')
+          JWT=$(spire-server jwt mint \
+            -socketPath "${SERVER_SOCKET}" \
+            -spiffeID   "${WORKLOAD_ID}" \
+            -audience   "${TRUST_DOMAIN}" \
+            2>&1)
+          echo "mint output: ${JWT}"
+
+          # Strip any leading label ("JWT Token:" etc.) — keep only the token
+          JWT=$(echo "${JWT}" | grep -oE '[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')
 
           if [ -z "${JWT}" ]; then
-            echo "FAIL: could not fetch JWT-SVID"
+            echo "=== server log ==="
+            cat /tmp/spire-server.log
+            echo "FAIL: could not mint JWT-SVID"
             exit 1
           fi
 
