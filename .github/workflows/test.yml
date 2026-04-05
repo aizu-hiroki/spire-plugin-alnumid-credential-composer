@@ -1,0 +1,194 @@
+name: Test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  # ─── Unit Tests ────────────────────────────────────────────────────────────
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test -v -count=1 ./...
+
+  # ─── E2E Tests ─────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    env:
+      SPIRE_VERSION:   "1.14.4"
+      TRUST_DOMAIN:    "example.org"
+      CLAIM_NAME:      "uid"
+      DOMAIN_CHARS:    "16"
+      PATH_CHARS:      "16"
+      SERVER_SOCKET:   "/tmp/spire-server/private/api.sock"
+      AGENT_SOCKET:    "/tmp/spire-agent/public/api.sock"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Build the plugin binary
+      - name: Build plugin
+        run: go build -o spire-plugin-alnumid-credential-composer .
+
+      # Download SPIRE server and agent binaries
+      - name: Download SPIRE binaries
+        run: |
+          curl -sSfL \
+            "https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz" \
+            | sudo tar -xz --strip-components=2 -C /usr/local/bin \
+                "spire-${SPIRE_VERSION}/bin/spire-server" \
+                "spire-${SPIRE_VERSION}/bin/spire-agent"
+          spire-server --version
+          spire-agent  --version
+
+      # Configure and start SPIRE server with the plugin
+      - name: Start SPIRE server
+        run: |
+          mkdir -p /tmp/spire-server
+
+          cat > /tmp/server.conf << EOF
+          server {
+            bind_address  = "127.0.0.1"
+            bind_port     = "8081"
+            trust_domain  = "${TRUST_DOMAIN}"
+            data_dir      = "/tmp/spire-server"
+            log_level     = "DEBUG"
+          }
+          plugins {
+            DataStore "sql" {
+              plugin_data {
+                database_type     = "sqlite3"
+                connection_string = "/tmp/spire-server/datastore.sqlite3"
+              }
+            }
+            KeyManager "memory"       { plugin_data {} }
+            NodeAttestor "join_token" { plugin_data {} }
+            CredentialComposer "alnumid" {
+              plugin_cmd = "$(pwd)/spire-plugin-alnumid-credential-composer"
+              plugin_data {
+                claim_name   = "${CLAIM_NAME}"
+                domain_chars = ${DOMAIN_CHARS}
+                path_chars   = ${PATH_CHARS}
+              }
+            }
+          }
+          EOF
+
+          spire-server run -config /tmp/server.conf &
+
+          echo "Waiting for SPIRE server..."
+          for i in $(seq 1 30); do
+            spire-server healthcheck -socketPath "${SERVER_SOCKET}" \
+              2>/dev/null && echo "Server ready." && break || sleep 1
+          done
+
+      # Issue a join token and register a workload entry
+      - name: Register workload entry
+        run: |
+          JOIN_TOKEN=$(spire-server token generate \
+            -socketPath "${SERVER_SOCKET}" \
+            -spiffeID  "spiffe://${TRUST_DOMAIN}/agent/ci" \
+            | awk '{print $2}')
+          echo "JOIN_TOKEN=${JOIN_TOKEN}" >> "$GITHUB_ENV"
+
+          WORKLOAD_SPIFFE_ID="spiffe://${TRUST_DOMAIN}/workload/ci"
+          echo "WORKLOAD_SPIFFE_ID=${WORKLOAD_SPIFFE_ID}" >> "$GITHUB_ENV"
+
+          spire-server entry create \
+            -socketPath "${SERVER_SOCKET}" \
+            -spiffeID   "${WORKLOAD_SPIFFE_ID}" \
+            -parentID   "spiffe://${TRUST_DOMAIN}/agent/ci" \
+            -selector   "unix:uid:$(id -u)"
+
+      # Start SPIRE agent using the join token
+      - name: Start SPIRE agent
+        run: |
+          mkdir -p /tmp/spire-agent
+
+          cat > /tmp/agent.conf << EOF
+          agent {
+            data_dir       = "/tmp/spire-agent"
+            log_level      = "DEBUG"
+            trust_domain   = "${TRUST_DOMAIN}"
+            server_address = "127.0.0.1"
+            server_port    = "8081"
+            socket_path    = "${AGENT_SOCKET}"
+          }
+          plugins {
+            NodeAttestor "join_token" {
+              plugin_data { join_token = "${JOIN_TOKEN}" }
+            }
+            KeyManager "memory"     { plugin_data {} }
+            WorkloadAttestor "unix" { plugin_data {} }
+          }
+          EOF
+
+          spire-agent run -config /tmp/agent.conf &
+
+          echo "Waiting for SPIRE agent socket..."
+          for i in $(seq 1 30); do
+            [ -S "${AGENT_SOCKET}" ] && echo "Agent ready." && break || sleep 1
+          done
+
+      # Fetch a JWT-SVID and verify the custom uid claim
+      - name: Verify uid claim in JWT-SVID
+        run: |
+          JWT=$(spire-agent api fetch jwt \
+            -audience   "spiffe://${TRUST_DOMAIN}" \
+            -socketPath "${AGENT_SOCKET}" \
+            | awk '/JWT Token/{print $NF}')
+
+          if [ -z "${JWT}" ]; then
+            echo "FAIL: could not fetch JWT-SVID"
+            exit 1
+          fi
+
+          # Decode JWT payload (base64url, no padding)
+          PAYLOAD=$(python3 - "${JWT}" << 'PYEOF'
+          import base64, json, sys
+          seg = sys.argv[1].split('.')[1]
+          seg += '=' * (-len(seg) % 4)
+          print(json.dumps(json.loads(base64.urlsafe_b64decode(seg)), indent=2))
+          PYEOF
+          )
+
+          echo "JWT payload:"
+          echo "${PAYLOAD}"
+
+          # Extract the custom claim
+          CLAIM_VAL=$(echo "${PAYLOAD}" | python3 -c \
+            "import sys, json; d = json.load(sys.stdin); print(d.get('${CLAIM_NAME}', 'MISSING'))")
+
+          EXPECTED_LEN=$(( DOMAIN_CHARS + PATH_CHARS ))
+          ACTUAL_LEN=${#CLAIM_VAL}
+
+          echo "Claim '${CLAIM_NAME}': ${CLAIM_VAL}"
+          echo "Expected: ${EXPECTED_LEN} hex chars / Actual: ${ACTUAL_LEN} chars"
+
+          # Verify length
+          if [ "${ACTUAL_LEN}" -ne "${EXPECTED_LEN}" ]; then
+            echo "FAIL: expected ${EXPECTED_LEN} chars, got ${ACTUAL_LEN}"
+            exit 1
+          fi
+
+          # Verify hex characters only
+          if ! echo "${CLAIM_VAL}" | grep -qE '^[0-9a-f]+$'; then
+            echo "FAIL: value contains non-hex characters"
+            exit 1
+          fi
+
+          echo "PASS: claim '${CLAIM_NAME}' = ${CLAIM_VAL}"
